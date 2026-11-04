@@ -4,6 +4,7 @@ Integration/Feature tests for API endpoints in server.py
 """
 import unittest
 import json
+import time
 import tempfile
 import shutil
 from pathlib import Path
@@ -15,6 +16,29 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
+import browser_worker
+
+
+def run_worker_in_process(cmd, deadline_s):
+    """Stand-in for run_in_process_group that runs the worker in this process.
+
+    The real helper starts a separate process, where unittest mocks of
+    seleniumbase.Driver would not apply. The process-group behaviour itself is
+    covered in test_helpers.TestRunInProcessGroup.
+    """
+    browser_worker.main(cmd[-2], cmd[-1])
+    return 0, False
+
+
+_worker_patch = patch('endpoints.article.run_in_process_group', run_worker_in_process)
+
+
+def setUpModule():
+    _worker_patch.start()
+
+
+def tearDownModule():
+    _worker_patch.stop()
 
 
 class TestHealthEndpoint(unittest.TestCase):
@@ -148,7 +172,7 @@ class TestArticleEndpointBasics(unittest.TestCase):
         self.assertIn('type', data['detail'][0])
         self.assertIn('msg', data['detail'][0])
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_with_url(self, mock_driver_class):
         """Test that /api/article works with URL parameter"""
         # Mock the Driver
@@ -168,7 +192,7 @@ class TestArticleEndpointBasics(unittest.TestCase):
         self.assertIn('title', data)
         self.assertIn('content', data)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_returns_all_required_fields(self, mock_driver_class):
         """Test that /api/article returns all required fields"""
         mock_driver = MagicMock()
@@ -204,7 +228,7 @@ class TestArticleEndpointBasics(unittest.TestCase):
         for field in required_fields:
             self.assertIn(field, data, f"Missing required field: {field}")
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_driver_called_correctly(self, mock_driver_class):
         """Test that Driver is instantiated with correct parameters"""
         mock_driver = MagicMock()
@@ -222,7 +246,7 @@ class TestArticleEndpointBasics(unittest.TestCase):
         self.assertTrue(call_kwargs['headless'])
         self.assertTrue(call_kwargs['uc'])
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_driver_quit_called(self, mock_driver_class):
         """Test that Driver.quit() is always called"""
         mock_driver = MagicMock()
@@ -235,7 +259,7 @@ class TestArticleEndpointBasics(unittest.TestCase):
         # Verify quit was called
         mock_driver.quit.assert_called_once()
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_handles_driver_exception(self, mock_driver_class):
         """Test that endpoint handles exceptions from Driver"""
         mock_driver = MagicMock()
@@ -249,8 +273,8 @@ class TestArticleEndpointBasics(unittest.TestCase):
         self.assertIn('detail', data)
         self.assertEqual(data['detail'][0]['type'], 'fetch_error')
 
-    @patch('endpoints.article.reap_abandoned_child_processes')
-    @patch('endpoints.article.Driver')
+    @patch('helpers.reap_abandoned_child_processes')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_reaps_after_success(
         self, mock_driver_class, mock_reap
     ):
@@ -264,8 +288,8 @@ class TestArticleEndpointBasics(unittest.TestCase):
 
         mock_reap.assert_called_once()
 
-    @patch('endpoints.article.reap_abandoned_child_processes')
-    @patch('endpoints.article.Driver')
+    @patch('helpers.reap_abandoned_child_processes')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_reaps_after_driver_init_failure(
         self, mock_driver_class, mock_reap
     ):
@@ -277,8 +301,8 @@ class TestArticleEndpointBasics(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         mock_reap.assert_called_once()
 
-    @patch('endpoints.article.reap_abandoned_child_processes')
-    @patch('endpoints.article.Driver')
+    @patch('helpers.reap_abandoned_child_processes')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_reaps_when_quit_fails(
         self, mock_driver_class, mock_reap
     ):
@@ -331,7 +355,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         shutil.rmtree(self.temp_screenshots_dir, ignore_errors=True)
         shutil.rmtree(self.temp_user_scripts_dir, ignore_errors=True)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_full_content_parameter(self, mock_driver_class):
         """Test full-content parameter includes full HTML"""
         mock_driver = MagicMock()
@@ -350,7 +374,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         self.assertIsNotNone(data['fullContent'])
         self.assertIn('Full HTML content', data['fullContent'])
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_viewport_parameters(self, mock_driver_class):
         """Test viewport-width and viewport-height parameters"""
         mock_driver = MagicMock()
@@ -363,7 +387,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         mock_driver.set_window_size.assert_called_once_with(1024, 768)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_timeout_parameter(self, mock_driver_class):
         """Test timeout parameter"""
         mock_driver = MagicMock()
@@ -374,9 +398,14 @@ class TestArticleEndpointParameters(unittest.TestCase):
         response = self.client.get('/api/article?url=https://example.com&timeout=30000')
         
         self.assertEqual(response.status_code, 200)
-        mock_driver.set_page_load_timeout.assert_called_once_with(30.0)
+        # The page load gets what is left of the request budget: the
+        # timeout less the response margin, less time already spent.
+        mock_driver.set_page_load_timeout.assert_called_once()
+        page_load_timeout = mock_driver.set_page_load_timeout.call_args[0][0]
+        self.assertLessEqual(page_load_timeout, 28.0)
+        self.assertGreater(page_load_timeout, 27.0)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     @patch('time.sleep')
     def test_article_endpoint_sleep_parameter(self, mock_sleep, mock_driver_class):
         """Test sleep parameter"""
@@ -393,7 +422,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         sleep_calls = [call[0][0] for call in mock_sleep.call_args_list]
         self.assertIn(2.0, sleep_calls)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_scroll_down_parameter(self, mock_driver_class):
         """Test scroll-down parameter"""
         mock_driver = MagicMock()
@@ -409,7 +438,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         script_calls = [str(call) for call in mock_driver.execute_script.call_args_list]
         self.assertTrue(any('scrollBy' in str(call) for call in script_calls))
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_user_scripts_parameter(self, mock_driver_class):
         """Test user-scripts parameter"""
         mock_driver = MagicMock()
@@ -428,7 +457,7 @@ class TestArticleEndpointParameters(unittest.TestCase):
         # Verify execute_script was called with user script
         mock_driver.execute_script.assert_called()
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_incognito_parameter(self, mock_driver_class):
         """Test incognito parameter"""
         mock_driver = MagicMock()
@@ -480,7 +509,7 @@ class TestArticleEndpointCaching(unittest.TestCase):
         shutil.rmtree(self.temp_screenshots_dir, ignore_errors=True)
         shutil.rmtree(self.temp_user_scripts_dir, ignore_errors=True)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_saves_to_cache(self, mock_driver_class):
         """Test that results are saved to cache"""
         mock_driver = MagicMock()
@@ -496,7 +525,7 @@ class TestArticleEndpointCaching(unittest.TestCase):
         cache_files = list(Path(self.temp_cache_dir).glob('*.json'))
         self.assertGreater(len(cache_files), 0)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_uses_cache_when_enabled(self, mock_driver_class):
         """Test that cached results are used when cache=true"""
         mock_driver = MagicMock()
@@ -518,7 +547,7 @@ class TestArticleEndpointCaching(unittest.TestCase):
         # Verify Driver was NOT instantiated again (cache was used)
         mock_driver_class.assert_not_called()
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_ignores_cache_by_default(self, mock_driver_class):
         """Test that cache is not used by default"""
         mock_driver = MagicMock()
@@ -577,7 +606,7 @@ class TestArticleEndpointScreenshot(unittest.TestCase):
         shutil.rmtree(self.temp_screenshots_dir, ignore_errors=True)
         shutil.rmtree(self.temp_user_scripts_dir, ignore_errors=True)
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_screenshot_parameter_false(self, mock_driver_class):
         """Test that screenshot is None when screenshot=false"""
         mock_driver = MagicMock()
@@ -591,7 +620,7 @@ class TestArticleEndpointScreenshot(unittest.TestCase):
         self.assertIsNone(data['screenshotUri'])
         mock_driver.save_screenshot.assert_not_called()
     
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_endpoint_screenshot_parameter_true(self, mock_driver_class):
         """Test that screenshot is taken when screenshot=true"""
         mock_driver = MagicMock()
@@ -661,7 +690,7 @@ class TestBearerTokenAuth(unittest.TestCase):
         data = json.loads(response.data)
         self.assertEqual(data['detail'][0]['type'], 'invalid_token')
 
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_accepts_the_token(self, mock_driver_class):
         """Test that /api/article answers with a valid token"""
         mock_driver = MagicMock()
@@ -676,7 +705,7 @@ class TestBearerTokenAuth(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_no_driver_starts_when_the_token_is_missing(
         self, mock_driver_class
     ):
@@ -705,7 +734,7 @@ class TestServerWithoutToken(unittest.TestCase):
         response = self.client.get('/')
         self.assertEqual(response.status_code, 200)
 
-    @patch('endpoints.article.Driver')
+    @patch('seleniumbase.Driver')
     def test_article_answers_without_a_token(self, mock_driver_class):
         """Test that /api/article answers without a configured token"""
         mock_driver = MagicMock()
@@ -716,3 +745,46 @@ class TestServerWithoutToken(unittest.TestCase):
         response = self.client.get('/api/article?url=https://example.com')
 
         self.assertEqual(response.status_code, 200)
+
+
+class TestArticleEndpointRequestBudget(unittest.TestCase):
+    """The timeout parameter bounds the whole request"""
+
+    def setUp(self):
+        server.app.config['TESTING'] = True
+        self.client = server.app.test_client()
+
+    @patch('endpoints.article.run_in_process_group')
+    def test_worker_deadline_stays_inside_the_timeout(self, mock_run):
+        mock_run.return_value = (None, True)
+        self.client.get('/api/article?url=https://example.com&timeout=30000')
+        deadline = mock_run.call_args[0][1]
+        self.assertLessEqual(deadline, 28.0)
+        self.assertGreater(deadline, 27.0)
+
+    @patch('endpoints.article.run_in_process_group')
+    def test_deadline_kill_returns_504(self, mock_run):
+        mock_run.return_value = (None, True)
+        response = self.client.get('/api/article?url=https://example.com&timeout=30000')
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(json.loads(response.data)['detail'][0]['type'], 'fetch_error')
+
+    @patch('endpoints.article.run_in_process_group')
+    def test_worker_without_result_is_an_error(self, mock_run):
+        mock_run.return_value = (-9, False)
+        response = self.client.get('/api/article?url=https://example.com&timeout=30000')
+        self.assertEqual(response.status_code, 500)
+
+    @patch('endpoints.article.run_in_process_group')
+    def test_busy_browser_returns_503_inside_the_timeout(self, mock_run):
+        import endpoints.article as article
+        article.BROWSER_SLOTS.acquire()
+        try:
+            started = time.monotonic()
+            response = self.client.get('/api/article?url=https://example.com&timeout=2500')
+            elapsed = time.monotonic() - started
+        finally:
+            article.BROWSER_SLOTS.release()
+        self.assertEqual(response.status_code, 503)
+        self.assertLess(elapsed, 2.5)
+        mock_run.assert_not_called()

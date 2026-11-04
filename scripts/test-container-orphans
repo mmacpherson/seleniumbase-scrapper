@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#
+# Container regression test for orphaned browsers.
+#
+# A browser that outlives its request keeps its threads and counts toward the
+# container's task limit until new browsers can no longer start. The test
+# starts a real container, points it at a local server that accepts
+# connections and never answers, and checks that:
+#
+#   1. a request that runs out of time returns 504 inside its timeout and
+#      leaves no Chrome process behind;
+#   2. concurrent requests never run more than one browser at a time, and
+#      each answers inside its own timeout;
+#   3. a normal scrape still returns 200 and leaves no Chrome behind;
+#   4. under a task limit too tight for a browser, failed starts leave no
+#      Chrome behind and give their tasks back. Before the fix, browsers
+#      whose start failed at the limit stayed running for good.
+#
+# Usage:
+#   scripts/test-container-orphans [IMAGE]
+#
+# Default: IMAGE=seleniumbase-scrapper:fix
+#
+# Exit code 0 means the test passed. Any other exit code means it failed.
+
+set -u
+
+IMAGE="${1:-seleniumbase-scrapper:fix}"
+CONTAINER="orphan-test-$$-${RANDOM}"
+HEALTH_TIMEOUT=90
+# Below one browser's peak (about 210 tasks), so browser starts fail part way,
+# as they do when overlapping requests reach a production limit.
+TIGHT_PIDS=160
+
+PAGE='<html><head><title>Regression page</title></head><body><p>ok</p></body></html>'
+DATA_URL="data:text/html,${PAGE}"
+HANG_PORT=9099
+HANG_URL="http://127.0.0.1:${HANG_PORT}/never-answers"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
+failures=0
+
+cleanup() {
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+}
+trap cleanup EXIT INT TERM
+
+fail() { echo "${RED}FAIL: $*${NC}"; failures=$((failures + 1)); }
+pass() { echo "${GREEN}PASS: $*${NC}"; }
+
+# Count top-level browser processes; renderers and helpers carry --type=.
+browsers() {
+    docker exec "$CONTAINER" ps -eo args= 2>/dev/null \
+        | grep -E '^(/bin/google-chrome|/opt/google/chrome/chrome|/usr/lib/chromium-browser/chromium-browser) ' \
+        | grep -vc -- '--type='
+}
+
+# Print "<http code> <seconds>" for one scrape.
+scrape() {
+    local url="$1" timeout_ms="$2"
+    docker exec "$CONTAINER" curl -s -o /dev/null -w '%{http_code} %{time_total}' -m 120 \
+        -G --data-urlencode "url=${url}" --data-urlencode "timeout=${timeout_ms}" \
+        "http://127.0.0.1:3000/api/article" 2>/dev/null
+}
+
+echo "${YELLOW}=============================================${NC}"
+echo "${YELLOW}Container orphaned-browser regression test${NC}"
+echo "${YELLOW}=============================================${NC}"
+echo "Image: $IMAGE"
+echo ""
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "${RED}Image $IMAGE is not present. Build it first.${NC}"
+    exit 1
+fi
+
+if ! docker run -d --name "$CONTAINER" "$IMAGE" >/dev/null; then
+    echo "${RED}Could not start the container.${NC}"
+    exit 1
+fi
+
+ready=0
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
+    if docker exec "$CONTAINER" curl -sf -m 2 http://127.0.0.1:3000/health >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+    echo "${RED}The API never became ready.${NC}"
+    docker logs "$CONTAINER" 2>&1 | tail -30
+    exit 1
+fi
+
+# A server that accepts connections and never sends a byte.
+docker exec -d "$CONTAINER" python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', ${HANG_PORT})); s.listen(64)
+held = []
+while True:
+    held.append(s.accept()[0])
+"
+sleep 1
+
+#--------------------------------------------------
+# Check 1: a request that runs out of time
+#--------------------------------------------------
+echo "--- Check 1: a page that never answers, timeout=8000"
+read -r code secs <<<"$(scrape "$HANG_URL" 8000)"
+echo "  HTTP $code after ${secs}s"
+if [ "$code" = "504" ]; then pass "the request returned 504"; else fail "expected 504, got $code"; fi
+if awk "BEGIN{exit !($secs < 8.0)}"; then
+    pass "it answered inside its 8 s timeout"
+else
+    fail "it took ${secs}s, past its 8 s timeout"
+fi
+sleep 2
+left="$(browsers)"
+if [ "$left" -eq 0 ]; then pass "no browser outlived the request"; else fail "$left browser(s) outlived the request"; fi
+echo ""
+
+#--------------------------------------------------
+# Check 2: concurrent requests
+#--------------------------------------------------
+echo "--- Check 2: three concurrent requests to a page that never answers, timeout=10000"
+out_dir="$(mktemp -d)"
+for i in 1 2 3; do
+    scrape "$HANG_URL" 10000 >"$out_dir/$i" &
+done
+peak=0
+for _ in $(seq 1 24); do
+    n="$(browsers)"
+    [ "$n" -gt "$peak" ] && peak="$n"
+    sleep 0.5
+done
+wait
+for i in 1 2 3; do
+    read -r code secs <"$out_dir/$i"
+    echo "  request $i: HTTP $code after ${secs}s"
+    if awk "BEGIN{exit !($secs < 10.0)}"; then :; else fail "request $i took ${secs}s, past its 10 s timeout"; fi
+    case "$code" in
+        503|504) ;;
+        *) fail "request $i returned $code, expected 503 or 504" ;;
+    esac
+done
+rm -rf "$out_dir"
+echo "  peak browsers: $peak"
+if [ "$peak" -le 1 ]; then pass "never more than one browser at a time"; else fail "$peak browsers ran at once"; fi
+sleep 2
+left="$(browsers)"
+if [ "$left" -eq 0 ]; then pass "no browser outlived the requests"; else fail "$left browser(s) outlived the requests"; fi
+echo ""
+
+#--------------------------------------------------
+# Check 3: a normal scrape
+#--------------------------------------------------
+echo "--- Check 3: a normal scrape"
+read -r code secs <<<"$(scrape "$DATA_URL" 30000)"
+echo "  HTTP $code after ${secs}s"
+if [ "$code" = "200" ]; then pass "the scrape returned 200"; else fail "expected 200, got $code"; fi
+left="$(browsers)"
+if [ "$left" -eq 0 ]; then pass "no browser outlived the scrape"; else fail "$left browser(s) outlived the scrape"; fi
+echo ""
+
+#--------------------------------------------------
+# Check 4: overlapping requests under a tight task limit
+#--------------------------------------------------
+echo "--- Check 4: four overlapping requests with --pids-limit ${TIGHT_PIDS}"
+docker rm -f "$CONTAINER" >/dev/null 2>&1
+if ! docker run -d --name "$CONTAINER" --pids-limit "$TIGHT_PIDS" "$IMAGE" >/dev/null; then
+    fail "could not start the task-limited container"
+else
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
+        docker exec "$CONTAINER" curl -sf -m 2 http://127.0.0.1:3000/health >/dev/null 2>&1 && break
+        sleep 1
+    done
+    for i in 1 2 3 4; do
+        docker exec "$CONTAINER" curl -s -o /dev/null -m 120 \
+            -G --data-urlencode "url=${DATA_URL}" --data-urlencode "sleep=6000" \
+            "http://127.0.0.1:3000/api/article" &
+    done
+    wait
+    sleep 3
+    left="$(browsers)"
+    if [ "$left" -eq 0 ]; then pass "no browser outlived the overlapping requests"; else fail "$left browser(s) outlived the overlapping requests"; fi
+    # Scrapes themselves may fail at this limit. What must not happen is a
+    # failed start leaving tasks held after its request has ended.
+    tasks="$(docker stats --no-stream --format '{{.PIDs}}' "$CONTAINER")"
+    echo "  tasks in use after the requests: $tasks"
+    if [ "$tasks" -le 10 ]; then pass "the task count returned to baseline"; else fail "$tasks tasks still held after the requests"; fi
+fi
+echo ""
+
+echo "${YELLOW}=============================================${NC}"
+if [ "$failures" -eq 0 ]; then
+    echo "${GREEN}All orphaned-browser checks passed.${NC}"
+    exit 0
+fi
+echo "${RED}${failures} orphaned-browser check(s) failed.${NC}"
+exit 1

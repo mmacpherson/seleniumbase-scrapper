@@ -23,6 +23,12 @@ Process-lifecycle coverage lives in two places:
 - `../../scripts/test-container-zombies` runs real browsers in a disposable
   container and counts zombies after every scrape. It is not part of CI. Run it
   by hand, as the main README explains.
+- `test_helpers.TestRunInProcessGroup` starts a real child that leaves a
+  grandchild behind, and checks the grandchild dies when the call returns and
+  when the deadline passes.
+- `../../scripts/test-container-orphans` checks, with real browsers, that no
+  Chrome outlives its request: on a deadline, under concurrent requests, and
+  when starts fail at a tight task limit. It is not part of CI either.
 
 ## Running Tests
 

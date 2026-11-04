@@ -9,6 +9,8 @@ import re
 import json
 import time
 import logging
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -208,3 +210,34 @@ def reap_abandoned_child_processes():
     if reaped:
         logger.info(f"Reaped {reaped} abandoned child process(es)")
     return reaped
+
+
+def run_in_process_group(cmd, deadline_s):
+    """Run cmd in a new session and kill its whole process group when it ends.
+
+    The command and everything it starts (chromedriver, Chrome and its
+    renderers) share one process group. That group is killed with SIGKILL
+    after the command exits or when the deadline passes, whichever comes
+    first, so no descendant outlives the call. Orphaned descendants are
+    reparented to PID 1 (tini), which reaps them.
+
+    Args:
+        cmd: argv list to run.
+        deadline_s: seconds the command may run before its group is killed.
+
+    Returns:
+        tuple: (returncode, timed_out). returncode is None when timed out.
+    """
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    timed_out = False
+    try:
+        proc.wait(timeout=max(deadline_s, 0))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+    return (None if timed_out else proc.returncode), timed_out

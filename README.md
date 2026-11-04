@@ -53,6 +53,8 @@ All available environment variables:
 - `API_HOST` (default: `0.0.0.0`) - The host/IP address the server binds to
 - `API_PORT` (default: `3000`) - The port the server listens on
 - `API_TOKEN` (default: empty) - Bearer token required on every endpoint except `/health`. Leave it empty to keep the API open. Separate several tokens with commas to rotate a token without downtime. A value that holds only whitespace or commas stops the server at startup, so a broken Secret cannot silently leave the API open.
+- `MAX_CONCURRENT_BROWSERS` (default: `1`) - Browsers that may run at once. Each Chrome holds a few hundred threads, which count toward a container's task limit (`pids_limit`). Further requests wait for a free browser within their own `timeout`, then get HTTP 503.
+- `DEADLINE_MARGIN_MS` (default: `2000`) - Time kept back from each request's `timeout` to build and send the response.
 
 #### Scraper and Browser Defaults
 - `DEFAULT_CACHE` (default: `false`)
@@ -197,7 +199,7 @@ All parameters except `url` have default values that can be set via environment 
 | Parameter | Description | Default | Env Variable |
 | :---------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------- | :-------- |
 | `incognito` | Allows creating `incognito` browser contexts. Incognito browser contexts don't write any browsing data to disk. | `true` | `DEFAULT_INCOGNITO` |
-| `timeout` | Maximum operation time to navigate to the page in milliseconds; defaults to 60000 (60 seconds). Pass 0 to disable the timeout. | `60000` | `DEFAULT_TIMEOUT` |
+| `timeout` | Maximum time for the whole request in milliseconds, including the wait for a free browser, page load, `sleep` and user scripts; defaults to 60000 (60 seconds). The API answers within `timeout` less `DEADLINE_MARGIN_MS`, with HTTP 504 if the page did not finish, so a client that gives its HTTP request the same timeout never retries while a browser is still working on its first attempt. Pass 0 to disable the timeout. | `60000` | `DEFAULT_TIMEOUT` |
 | `wait-until` | When to consider navigation succeeded, defaults to `domcontentloaded`. Events can be either:<br/>`load` - consider operation to be finished when the `load` event is fired.<br/>`domcontentloaded` - consider operation to be finished when the DOMContentLoaded event is fired.<br/>`networkidle` - consider operation to be finished when there are no network connections for at least 500 ms.<br/>`commit` - consider operation to be finished when network response is received and the document started loading. | `domcontentloaded` | `DEFAULT_WAIT_UNTIL` |
 | `sleep` | Waits for the given timeout in milliseconds before parsing the article, and after the page has loaded. In many cases, a sleep timeout is not necessary. However, for some websites, it can be quite useful. Other waiting mechanisms, such as waiting for selector visibility, are not currently supported. The default value is 0, which means no sleep. | `0` | `DEFAULT_SLEEP` |
 | `resource` | List of resource types allowed to be loaded on the page. All other resources will not be allowed, and their network requests will be aborted. **By default, all resource types are allowed.** The following resource types are supported: `document`, `stylesheet`, `image`, `media`, `font`, `script`, `texttrack`, `xhr`, `fetch`, `eventsource`, `websocket`, `manifest`, `other`. Example: `document,stylesheet,fetch`. | | `DEFAULT_RESOURCE` |
@@ -449,6 +451,26 @@ The arm64 image was not measured. The `tini` package exists for arm64 in Ubuntu
 Run `scripts/test-container-zombies` to check this yourself. See
 [Testing](#testing).
 
+### Browser Lifetime
+
+Every scrape runs in a separate worker process (`api/browser_worker.py`),
+started in its own session. The worker, chromedriver and every Chrome process
+share one process group, and the API kills that group when the request ends:
+after a result, after an error, or when the request runs out of time. A
+browser cannot outlive its request, even when `Driver()` failed part way
+through startup or `quit()` failed, which the `finally` block alone could not
+guarantee.
+
+Before this, a browser start that failed part way left Chrome running with
+nothing holding a reference to quit it. Each one kept its threads, so the next
+start was more likely to hit the container's task limit and fail the same way,
+until every scrape failed. Overlapping retries from clients whose HTTP timeout
+expired before the API answered made the first failure likely; the request
+deadline and `MAX_CONCURRENT_BROWSERS` prevent that overlap.
+
+Run `scripts/test-container-orphans` to check this yourself. It fails 11 checks
+against v1.0.1 and passes against this version.
+
 ## Container Management
 
 ### View Logs
@@ -516,10 +538,11 @@ The project includes comprehensive test coverage for the API server, covering bo
 
 ### Test Structure
 
-- **api/tests/test_helpers.py** - Unit tests for helper functions (cache operations, parameter parsing, HTML extraction, child-process reaping)
+- **api/tests/test_helpers.py** - Unit tests for helper functions (cache operations, parameter parsing, HTML extraction, child-process reaping, process-group cleanup)
 - **api/tests/test_endpoints.py** - Integration tests for API endpoints (/health, /, /api/article)
 - **api/tests/test_auth.py** - Unit tests for bearer token authentication
 - **scripts/test-container-zombies** - Container regression test that scrapes with a real browser and counts zombie processes
+- **scripts/test-container-orphans** - Container regression test for browsers that outlive their request: request deadlines, one browser at a time, and failed starts under a tight task limit
 - **scripts/test-container-auth** - Container test that checks the token over real HTTP
 
 ### Running Tests

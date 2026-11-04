@@ -3,14 +3,18 @@
 Article endpoint for SeleniumBase API
 """
 from flask import request, jsonify
-from seleniumbase import Driver
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from datetime import datetime
+from pathlib import Path
 import logging
 import hashlib
-import time
+import json
 import os
+import sys
+import tempfile
+import threading
+import time
 
 # Import helper functions
 from helpers import (
@@ -18,10 +22,19 @@ from helpers import (
     parse_bool_param, parse_int_param, parse_list_param,
     extract_meta_tags, extract_article_content, 
     extract_text_content, extract_published_time,
-    reap_abandoned_child_processes
+    run_in_process_group
 )
 
 logger = logging.getLogger(__name__)
+
+WORKER = Path(__file__).resolve().parent.parent / 'browser_worker.py'
+
+# Each browser holds a few hundred threads. Running one at a time keeps a
+# container inside its task limit; a queued request waits for the slot.
+BROWSER_SLOTS = threading.BoundedSemaphore(int(os.getenv('MAX_CONCURRENT_BROWSERS', '1')))
+
+# Time kept back from the request timeout to build and send the response.
+DEADLINE_MARGIN_MS = int(os.getenv('DEADLINE_MARGIN_MS', '2000'))
 
 
 def register_routes(app, cache_dir, user_scripts_dir, screenshots_dir, 
@@ -146,110 +159,59 @@ def register_routes(app, cache_dir, user_scripts_dir, screenshots_dir,
                     return jsonify(cached_result), 200
             
             logger.info(f"Fetching URL: {url}")
-            
-            # Detect browser type: Chromium vs Chrome (Chromium is used for arm64 arch)
-            # If /usr/bin/chromium-browser exists, we're using Chromium (uc=False)
-            # Otherwise, we're using Chrome (uc=True)
-            is_chromium = os.path.exists('/usr/bin/chromium-browser')
-            use_uc_mode = not is_chromium
-            
-            logger.info(f"Browser detected: {'Chromium' if is_chromium else 'Chrome'}, uc mode: {use_uc_mode}")
-            
-            # Initialize SeleniumBase Driver with configuration
-            driver_kwargs = {
-                'browser': 'chrome',
-                'headless': True,
-                'uc': use_uc_mode,
-                'incognito': incognito,
-            }
-            
-            # Note: SeleniumBase Driver may not support all these options directly
-            # We'll use what's available and log warnings for unsupported features
-            
-            driver = None
+
+            # The timeout parameter bounds the whole request, including the
+            # wait for a free browser. Callers such as PriceBuddy give their
+            # HTTP client the same timeout, so finishing inside it means a
+            # retry never overlaps a browser still working on the first try.
+            started = time.monotonic()
+            budget_s = (timeout - DEADLINE_MARGIN_MS) / 1000.0 if timeout > 0 else None
+
+            def remaining():
+                return None if budget_s is None else budget_s - (time.monotonic() - started)
+
+            if not BROWSER_SLOTS.acquire(timeout=max(remaining(), 0) if budget_s is not None else -1):
+                return jsonify({'detail': [{'type': 'busy',
+                                            'msg': 'No browser became free before the request timeout'}]}), 503
             try:
-                driver = Driver(**driver_kwargs)
-                
-                # Set timeout (convert milliseconds to seconds)
-                if timeout > 0:
-                    driver.set_page_load_timeout(timeout / 1000.0)
-                
-                # Set viewport size if specified
-                if viewport_width and viewport_height:
-                    driver.set_window_size(viewport_width, viewport_height)
-                
-                # Navigate to the URL
-                driver.get(url)
-                
-                # Run user scripts if specified
-                if user_scripts:
-                    script_names = [s.strip() for s in user_scripts.split(',') if s.strip()]
-                    for script_name in script_names:
-                        script_path = user_scripts_dir / script_name
-                        if script_path.exists():
-                            try:
-                                with open(script_path, 'r') as f:
-                                    script_code = f.read()
-                                driver.execute_script(script_code)
-                                logger.info(f"Executed user script: {script_name}")
-                            except Exception as e:
-                                logger.warning(f"Failed to execute user script {script_name}: {e}")
-                        else:
-                            logger.warning(f"User script not found: {script_name}")
-                    
-                    # Wait after user scripts
-                    if user_scripts_timeout > 0:
-                        time.sleep(user_scripts_timeout / 1000.0)
-                
-                # Sleep if specified
-                if sleep_time > 0:
-                    time.sleep(sleep_time / 1000.0)
-                
-                # Scroll down if specified
-                if scroll_down > 0:
-                    driver.execute_script(f"window.scrollBy(0, {scroll_down});")
-                    # Give time for lazy-loaded content
-                    time.sleep(0.5)
-                
-                # Get the final URL after redirects
-                final_url = driver.current_url
-                
-                # Get the page HTML
-                html_content = driver.page_source
-                
-                # Take screenshot if requested
-                screenshot_uri = None
-                if screenshot:
-                    try:
-                        screenshot_filename = f"{cache_key}.png"
-                        screenshot_path = screenshots_dir / screenshot_filename
-                        
-                        # Try full page screenshot first
-                        try:
-                            driver.save_screenshot(str(screenshot_path))
-                            screenshot_uri = f"file://screenshots/{screenshot_filename}"
-                            logger.info(f"Screenshot saved: {screenshot_filename}")
-                        except Exception as e:
-                            logger.warning(f"Failed to save screenshot: {e}")
-                            screenshot_uri = None
-                    except Exception as e:
-                        logger.warning(f"Screenshot failed: {e}")
-                
-                logger.info(f"Successfully fetched {len(html_content)} bytes from {url}")
-                
+                screenshot_path = str(screenshots_dir / f"{cache_key}.png") if screenshot else None
+                opts = {
+                    'url': url,
+                    'incognito': incognito,
+                    'page_load_timeout': max(remaining(), 1) if budget_s is not None else 0,
+                    'viewport_width': viewport_width,
+                    'viewport_height': viewport_height,
+                    'user_scripts': [s.strip() for s in user_scripts.split(',') if s.strip()] if user_scripts else [],
+                    'user_scripts_dir': str(user_scripts_dir),
+                    'user_scripts_timeout': user_scripts_timeout,
+                    'sleep': sleep_time,
+                    'scroll_down': scroll_down,
+                    'screenshot_path': screenshot_path,
+                }
+                with tempfile.TemporaryDirectory(prefix='fetch-') as work:
+                    request_file = Path(work) / 'request.json'
+                    result_file = Path(work) / 'result.json'
+                    request_file.write_text(json.dumps(opts))
+                    deadline = max(remaining(), 0) if budget_s is not None else 24 * 3600
+                    _, timed_out = run_in_process_group(
+                        [sys.executable, str(WORKER), str(request_file), str(result_file)],
+                        deadline)
+                    result = json.loads(result_file.read_text()) if result_file.exists() else None
             finally:
-                # Always close the driver
-                if driver:
-                    try:
-                        driver.quit()
-                    except Exception as e:
-                        # A failed quit must not skip the reap below
-                        logger.warning(f"driver.quit() failed: {e}")
-                # SeleniumBase abandons one chromedriver Popen object per
-                # driver start, which leaves a zombie. Reap it here, at the
-                # boundary that owns the driver. This also runs when Driver()
-                # itself failed part way through.
-                reap_abandoned_child_processes()
+                BROWSER_SLOTS.release()
+
+            if timed_out:
+                return jsonify({'detail': [{'type': 'fetch_error',
+                                            'msg': f'Failed to fetch URL: no result within {timeout} ms'}]}), 504
+            if result is None:
+                raise RuntimeError('browser worker exited without a result')
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+
+            final_url = result['final_url']
+            html_content = result['html']
+            screenshot_uri = result['screenshot_uri']
+            logger.info(f"Successfully fetched {len(html_content)} bytes from {url}")
             
             # Parse HTML with BeautifulSoup
             soup = BeautifulSoup(html_content, 'html.parser')

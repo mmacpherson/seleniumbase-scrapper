@@ -604,3 +604,66 @@ class TestReapAbandonedChildProcesses(unittest.TestCase):
 
         self.assertGreaterEqual(reaped, 1)
         self.assertNotEqual(self._process_state(pid), 'Z')
+
+
+def _pid_alive(pid):
+    """True while pid exists and is not a zombie."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except FileNotFoundError:
+        return False
+
+
+def _wait_dead(pid, seconds=5.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestRunInProcessGroup(unittest.TestCase):
+    """run_in_process_group must leave no descendant behind"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pid_file = Path(self.tmp) / 'grandchild.pid'
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cmd(self, then):
+        # Start a long-lived grandchild, the stand-in for a Chrome that its
+        # parent never quit, then run `then` in the direct child.
+        script = (
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen(['sleep', '60'])\n"
+            f"open({str(self.pid_file)!r}, 'w').write(str(p.pid))\n"
+            f"{then}\n"
+        )
+        return [sys.executable, '-c', script]
+
+    def _grandchild(self):
+        end = time.monotonic() + 5
+        while not self.pid_file.exists() or not self.pid_file.read_text():
+            self.assertLess(time.monotonic(), end, "grandchild never started")
+            time.sleep(0.05)
+        return int(self.pid_file.read_text())
+
+    def test_returns_exit_code(self):
+        returncode, timed_out = helpers.run_in_process_group([sys.executable, '-c', 'raise SystemExit(3)'], 10)
+        self.assertEqual((returncode, timed_out), (3, False))
+
+    def test_kills_descendants_left_by_a_finished_command(self):
+        returncode, timed_out = helpers.run_in_process_group(self._cmd("sys.exit(0)"), 10)
+        self.assertEqual((returncode, timed_out), (0, False))
+        self.assertTrue(_wait_dead(self._grandchild()), "grandchild outlived the call")
+
+    def test_kills_the_group_at_the_deadline(self):
+        started = time.monotonic()
+        returncode, timed_out = helpers.run_in_process_group(self._cmd("time.sleep(60)"), 1)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual((returncode, timed_out), (None, True))
+        self.assertTrue(_wait_dead(self._grandchild()), "grandchild outlived the deadline")
